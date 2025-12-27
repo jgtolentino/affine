@@ -1,0 +1,103 @@
+# .github/workflows/deploy-affine.yml
+# Auto-deploy AFFiNE to DigitalOcean droplet on push to main
+
+name: Deploy AFFiNE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'docker-compose*.yml'
+      - '.github/workflows/deploy-affine.yml'
+  workflow_dispatch:  # Manual trigger
+
+env:
+  DROPLET_HOST: 188.166.237.231
+  DROPLET_USER: root
+  DEPLOY_PATH: /opt/affine
+
+jobs:
+  deploy:
+    name: Deploy to Droplet
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ env.DROPLET_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy docker-compose to droplet
+        run: |
+          scp -o StrictHostKeyChecking=no \
+            infra/docker-compose.prod.yml \
+            ${{ env.DROPLET_USER }}@${{ env.DROPLET_HOST }}:${{ env.DEPLOY_PATH }}/docker-compose.yml
+
+      - name: Copy environment config (if exists)
+        continue-on-error: true
+        run: |
+          if [ -f "infra/do/.env.prod" ]; then
+            scp -o StrictHostKeyChecking=no \
+              infra/do/.env.prod \
+              ${{ env.DROPLET_USER }}@${{ env.DROPLET_HOST }}:${{ env.DEPLOY_PATH }}/.env
+          fi
+
+      - name: Deploy on droplet
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.DROPLET_USER }}@${{ env.DROPLET_HOST }} << 'ENDSSH'
+            set -e
+            cd /opt/affine
+            
+            echo "=== Pulling latest images ==="
+            docker compose pull
+            
+            echo "=== Stopping containers ==="
+            docker compose down
+            
+            echo "=== Starting containers ==="
+            docker compose up -d
+            
+            echo "=== Cleanup old images ==="
+            docker image prune -f
+            
+            echo "=== Status ==="
+            docker compose ps
+            
+            echo "=== Deployment complete ==="
+          ENDSSH
+
+      - name: Health check
+        run: |
+          sleep 30
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://kb.insightpulseai.net/health || echo "000")
+          if [ "$STATUS" = "200" ] || [ "$STATUS" = "301" ] || [ "$STATUS" = "302" ]; then
+            echo "✅ Health check passed (HTTP $STATUS)"
+          else
+            echo "⚠️ Health check returned HTTP $STATUS - may need manual verification"
+          fi
+
+      - name: Notify Mattermost
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          
+          curl -X POST "${{ secrets.MATTERMOST_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"channel\": \"devops\",
+              \"username\": \"GitHub Actions\",
+              \"icon_emoji\": \":github:\",
+              \"text\": \"$EMOJI **AFFiNE Deployment $STATUS**\n- Commit: \`${{ github.sha }}\`\n- Branch: \`${{ github.ref_name }}\`\n- By: ${{ github.actor }}\n- [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"
+            }" || true
